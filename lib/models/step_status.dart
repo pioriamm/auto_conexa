@@ -1,0 +1,1 @@
+enum StepStatus { pendente, carregando, pronto, processando }
