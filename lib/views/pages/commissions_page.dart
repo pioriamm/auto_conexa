@@ -251,9 +251,15 @@ class _CommissionsPageState extends State<CommissionsPage> {
   Map<String, Map<String, String>> _buildTenexIndex() {
     final tenexById = <String, Map<String, String>>{};
     for (final item in _tenexJsonList) {
+      // índice por ID
       final id = (item['id'] ?? '').toString();
       for (final key in clientIdLookupKeys(id)) {
         _putTenexIndex(tenexById, key, item);
+      }
+      // índice por CNPJ (dígitos), para fallback quando o ID não bater
+      final cnpjDigits = digitsOnly(item['cnpj'] ?? '');
+      if (cnpjDigits.isNotEmpty) {
+        _putTenexIndex(tenexById, cnpjDigits, item);
       }
     }
     return tenexById;
@@ -434,6 +440,50 @@ class _CommissionsPageState extends State<CommissionsPage> {
     return productByCustomerId;
   }
 
+  /// Para customerIds não encontrados no base_tenex, busca CNPJ e nome
+  /// no endpoint /customer/{id} e tenta novo lookup no tenex pelo CNPJ.
+  Future<Map<String, _CustomerApiData>> _fetchCustomerDetails(
+    Set<String> missingIds,
+    Map<String, Map<String, String>> tenexById,
+  ) async {
+    final result = <String, _CustomerApiData>{};
+    var processed = 0;
+
+    for (final customerId in missingIds) {
+      if (!mounted) return result;
+      processed++;
+      setState(() => _status =
+          'Buscando cliente na API ($processed/${missingIds.length}): #$customerId...');
+
+      try {
+        final decoded =
+            await _apiGet('$_apiBase/customer/$customerId') as Map<String, dynamic>;
+
+        final name = decoded['name']?.toString() ?? '';
+        final legalPerson = decoded['legalPerson'];
+        final rawCnpj = legalPerson is Map
+            ? (legalPerson['cnpj']?.toString() ?? '')
+            : '';
+
+        // Tenta achar no tenex pelo CNPJ
+        final cnpjDigits = digitsOnly(rawCnpj);
+        final tenex = cnpjDigits.isNotEmpty ? tenexById[cnpjDigits] : null;
+
+        result[customerId] = _CustomerApiData(
+          name: name,
+          cnpj: rawCnpj,
+          tenex: tenex,
+        );
+      } catch (_) {
+        // Se a chamada falhar, o cliente ficará sem enriquecimento
+      }
+
+      if (processed % 5 == 0) await Future<void>.delayed(Duration.zero);
+    }
+
+    return result;
+  }
+
   Future<void> _fetchFromApi() async {
     final rangeError = _validateDateRange();
     if (rangeError != null) {
@@ -468,16 +518,27 @@ class _CommissionsPageState extends State<CommissionsPage> {
         return;
       }
 
-      // 2. Busca product.name via endpoint sales (por customerId)
+      // 2. Coleta customerIds únicos
       final uniqueCustomerIds = allCharges
           .map((c) => c['customerId']?.toString() ?? '')
           .where((id) => id.isNotEmpty)
           .toSet();
+
+      // 3. Busca product.name via endpoint sales
       final productByCustomerId =
           await _fetchProductNames(uniqueCustomerIds, dateFrom, dateTo);
       if (!mounted) return;
 
-      // 3. Monta e exibe as linhas progressivamente
+      // 4. Para IDs não encontrados no base_tenex, busca dados via /customer/{id}
+      final missingIds = uniqueCustomerIds
+          .where((id) => _lookupByClientId(tenexById, id) == null)
+          .toSet();
+      final customerApiData = missingIds.isNotEmpty
+          ? await _fetchCustomerDetails(missingIds, tenexById)
+          : <String, _CustomerApiData>{};
+      if (!mounted) return;
+
+      // 5. Monta e exibe as linhas progressivamente
       setState(() {
         _totalApiCount = allCharges.length;
         _status = 'Processando ${allCharges.length} registros...';
@@ -488,6 +549,7 @@ class _CommissionsPageState extends State<CommissionsPage> {
           allCharges[i],
           tenexById,
           productByCustomerId,
+          customerApiData,
         );
         if (!mounted) return;
         setState(() {
@@ -517,14 +579,31 @@ class _CommissionsPageState extends State<CommissionsPage> {
     Map<String, dynamic> item,
     Map<String, Map<String, String>> tenexById,
     Map<String, String> productByCustomerId,
+    Map<String, _CustomerApiData> customerApiData,
   ) {
     final customerId = item['customerId']?.toString() ?? '';
-    final tenex = customerId.isNotEmpty
+
+    // 1ª tentativa: lookup pelo customerId no base_tenex
+    Map<String, String>? tenex = customerId.isNotEmpty
         ? _lookupByClientId(tenexById, customerId)
         : null;
 
-    final razaoSocial = _tenexValueOrCurrent(tenex, 'razaoSocial', '');
-    final cnpj = _formatCnpj(_tenexValueOrCurrent(tenex, 'cnpj', ''));
+    String razaoSocial;
+    String cnpj;
+
+    if (tenex != null) {
+      // Encontrado pelo ID — usa dados do tenex normalmente
+      razaoSocial = _tenexValueOrCurrent(tenex, 'razaoSocial', '');
+      cnpj = _formatCnpj(_tenexValueOrCurrent(tenex, 'cnpj', ''));
+    } else {
+      // 2ª tentativa: dados vindos do endpoint /customer/{id}
+      final apiData = customerApiData[customerId];
+      // O tenex encontrado pelo CNPJ (já resolvido em _fetchCustomerDetails)
+      tenex = apiData?.tenex;
+      razaoSocial = apiData?.name ?? '';
+      cnpj = _formatCnpj(apiData?.cnpj ?? '');
+    }
+
     final grupo = _tenexValueOrCurrent(tenex, 'grupo', '');
     final parceiro = _tenexValueOrCurrent(tenex, 'parceiro', '');
     final vendedor = _tenexValueOrCurrent(tenex, 'vendedor', '');
@@ -1773,6 +1852,17 @@ class _CommissionsPageState extends State<CommissionsPage> {
 }
 
 // ── Supporting types ───────────────────────────────────────────────────────────
+
+class _CustomerApiData {
+  const _CustomerApiData({
+    required this.name,
+    required this.cnpj,
+    required this.tenex,
+  });
+  final String name;
+  final String cnpj;
+  final Map<String, String>? tenex;
+}
 
 class _ConsolidadoTotais {
   const _ConsolidadoTotais({

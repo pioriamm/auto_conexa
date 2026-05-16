@@ -20,7 +20,7 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  static const _validUser = 'alianca_financeiro';
+  static const _validUser = 'financeiro';
   static const _validPass = 'Alianca@2026';
 
   final _userController = TextEditingController();
